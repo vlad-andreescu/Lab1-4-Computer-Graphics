@@ -89,9 +89,33 @@ public:
 	// t>=0 the distance between the ray origin and P (i.e., the parameter along the ray)
 	// and the unit normal N
 	bool intersect(const Ray& ray, Vector& P, double &t, Vector& N) const {
-		 // TODO (lab 1) : compute the intersection (just true/false at the begining of lab 1, then P, t and N as well)
-		return false;
-	}
+
+        Vector OC = ray.O - C;
+        double dot_u_OC = dot(ray.u, OC);
+        double delta = dot_u_OC * dot_u_OC - (OC.norm2() - R * R); 
+
+        if (delta < 0) {
+            return false;
+        }
+
+        double sqrt_delta=sqrt(delta);
+        
+        double t1 = -dot_u_OC - sqrt_delta;
+        double t2 = -dot_u_OC + sqrt_delta;
+
+        if (t1 > 0) {
+            t = t1; 
+        } else if (t2 > 0) {
+            t = t2; 
+        } else {
+            return false;
+        }
+        
+        P = ray.O + t * ray.u;
+        N = (P - C) / R;
+
+        return true;
+    }
 
 	double R;
 	Vector C;
@@ -126,9 +150,26 @@ public:
 
 		// TODO (lab 1): iterate through the objects and check the intersections with all of them, 
 		// and keep the closest intersection, i.e., the one if smallest positive value of t
+        double closest_t = 1e99;
+        bool has_intersection = false;
 
-		return false;
-	}
+        for (int i=0; i<objects.size(); i++) {
+            Vector current_P, current_N;
+            double current_t;
+            
+            if (objects[i]->intersect(ray, current_P, current_t, current_N)) {
+                if (current_t<closest_t && current_t>0) {
+                    closest_t=current_t;
+                    object_id=i;
+                    P=current_P;
+                    t=current_t;
+                    N=current_N;
+                    has_intersection=true;
+                }
+            }
+        }
+        return has_intersection;
+    }
 
 
 	// return the radiance (color) along ray
@@ -145,10 +186,16 @@ public:
 		if (intersect(ray, P, t, N, object_id)) {
 
 			if (objects[object_id]->mirror) {
+                Vector I = ray.u;
+                Vector R = I - N * 2.0 * dot(I, N);
+                R.normalize();
 
-				// return getColor in the reflected direction, with recursion_depth+1 (recursively)
-			} // else
+                Vector reflected_origin = P + N * 1e-4;
+                Ray reflected_ray(reflected_origin, R);
 
+                return getColor(reflected_ray, recursion_depth + 1);
+            }
+			
 			if (objects[object_id]->transparent) { // optional
 
 				// return getColor in the refraction direction, with recursion_depth+1 (recursively)
@@ -156,15 +203,32 @@ public:
 
 			// test if there is a shadow by sending a new ray
 			// if there is no shadow, compute the formula with dot products etc.
+			Vector L_dir = light_position - P;
+            double dist_to_light2 = L_dir.norm2();
+            double dist_to_light = sqrt(dist_to_light2);
+            Vector L = L_dir / dist_to_light;
 
+            Vector shadow_origin = P + N * 1e-4; 
+            Ray shadow_ray(shadow_origin, L);
+            
+            Vector shadow_P, shadow_N;
+            double shadow_t;
+            int shadow_object_id;
+            bool in_shadow = intersect(shadow_ray, shadow_P, shadow_t, shadow_N, shadow_object_id);
 
-			// TODO (lab 2) : add indirect lighting component with a recursive call
-		}
+            if (in_shadow && shadow_t < dist_to_light) {
+                return Vector(0, 0, 0); 
+            }
+            double dot_product = dot(N, L);
+            double n_dot_l = dot_product > 0.0 ? dot_product : 0.0; 
+            double intensity_factor = light_intensity / (4.0*M_PI*dist_to_light2);
+            Vector albedo = objects[object_id]->albedo;
+            
+            return (albedo / M_PI) * intensity_factor * n_dot_l;
+        }
 
-		
-
-		return Vector(0, 0, 0);
-	}
+        return Vector(0, 0, 0);
+    }
 
 	std::vector<const Object*> objects;
 
@@ -191,45 +255,55 @@ int main() {
 	Sphere floor(Vector(0, -1000, 0), 990, Vector(0.6, 0.5, 0.7));
 
 	Scene scene;
-	scene.camera_center = Vector(0, 0, 0);
+	scene.camera_center = Vector(0, 0, 55);
 	scene.light_position = Vector(-10,20,40);
 	scene.light_intensity = 3E7;
 	scene.fov = 60 * M_PI / 180.;
-	scene.gamma = 1.0;    // TODO (lab 1) : play with gamma ; typically, gamma = 2.2
+	scene.gamma = 2.2;    // TODO (lab 1) : play with gamma ; typically, gamma = 2.2
 	scene.max_light_bounce = 5;
 
 	scene.addObject(&center_sphere);
 
-	/*
 	scene.addObject(&wall_left);
 	scene.addObject(&wall_right);
 	scene.addObject(&wall_front);
 	scene.addObject(&wall_behind);
 	scene.addObject(&ceiling);
 	scene.addObject(&floor);
-	*/
 
 	std::vector<unsigned char> image(W * H * 3, 0);
+
+	double d = (W / 2.0) / std::tan(scene.fov / 2.0);
 
 #pragma omp parallel for schedule(dynamic, 1)
 	for (int i = 0; i < H; i++) {
 		for (int j = 0; j < W; j++) {
 			Vector color;
 
-			// TODO (lab 1) : correct ray_direction so that it goes through each pixel (j, i)			
-			Vector ray_direction(0., 0., -1);
+			// TODO (lab 1) : correct ray_direction so that it goes through each pixel (j, i)
+			double x = j - W / 2.0 + 0.5;
+            double y = H / 2.0 - i - 0.5;
+            double z = -d;
 
-			Ray ray(scene.camera_center, ray_direction);
+
+			Vector ray_direction(x, y, z);
+            ray_direction.normalize();
+
+            Ray ray(scene.camera_center, ray_direction);
+            color = scene.getColor(ray, 0);
+
+			double c0 = 255. * std::pow(color[0] / 255., 1. / 2.2);
+			double c1 = 255. * std::pow(color[1] / 255., 1. / 2.2);
+			double c2 = 255. * std::pow(color[2] / 255., 1. / 2.2);
 
 			// TODO (lab 2) : add Monte Carlo / averaging of random ray contributions here
 			// TODO (lab 2) : add antialiasing by altering the ray_direction here
 			// TODO (lab 2) : add depth of field effect by altering the ray origin (and direction) here
 
-			color  = scene.getColor(ray, 0);
 
-			image[(i * W + j) * 3 + 0] = std::min(255., std::max(0., 255. * std::pow(color[0] / 255., 1. / scene.gamma)));
-			image[(i * W + j) * 3 + 1] = std::min(255., std::max(0., 255. * std::pow(color[1] / 255., 1. / scene.gamma)));
-			image[(i * W + j) * 3 + 2] = std::min(255., std::max(0., 255. * std::pow(color[2] / 255., 1. / scene.gamma)));
+			image[(i * W + j) * 3 + 0] = c0 > 255. ? 255. : (c0 < 0. ? 0. : c0);
+            image[(i * W + j) * 3 + 1] = c1 > 255. ? 255. : (c1 < 0. ? 0. : c1);
+            image[(i * W + j) * 3 + 2] = c2 > 255. ? 255. : (c2 < 0. ? 0. : c2);
 		}
 	}
 	stbi_write_png("image.png", W, H, 3, &image[0], 0);
