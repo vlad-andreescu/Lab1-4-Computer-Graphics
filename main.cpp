@@ -2,6 +2,7 @@
 #include <vector>
 #include <cmath>
 #include <random>
+#include <omp.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -133,6 +134,24 @@ public:
 	}
 };
 
+Vector random_cos(const Vector& N) {
+    double r1 = uniform(engine[omp_get_thread_num()]);
+	double r2 = uniform(engine[omp_get_thread_num()]);
+    double lx = cos(2.0 * M_PI * r1) * sqrt(1.0 - r2);
+    double ly = sin(2.0 * M_PI * r1) * sqrt(1.0 - r2);
+    double lz = sqrt(r2);
+    Vector T1;
+    if (fabs(N[0]) <= fabs(N[1]) && fabs(N[0]) <= fabs(N[2]))
+        T1 = Vector(0.0, -N[2], N[1]);
+    else if (fabs(N[1]) <= fabs(N[0]) && fabs(N[1]) <= fabs(N[2]))
+        T1 = Vector(-N[2], 0.0, N[0]);
+    else
+        T1 = Vector(-N[1], N[0], 0.0);
+    T1.normalize();
+    Vector T2 = cross(N, T1);
+    return lx * T1 + ly * T2 + lz * N;
+}
+
 
 class Scene {
 public:
@@ -196,10 +215,29 @@ public:
                 return getColor(reflected_ray, recursion_depth + 1);
             }
 			
-			if (objects[object_id]->transparent) { // optional
+			if (objects[object_id]->transparent) {
+				double n1 = 1.0, n2 = 1.5;
+				Vector Nrefract = N;
 
-				// return getColor in the refraction direction, with recursion_depth+1 (recursively)
-			} // else
+				if (dot(ray.u, N) > 0) {
+					n1 = 1.5; n2 = 1.0;
+					Nrefract = Vector(-N[0], -N[1], -N[2]);
+				}
+
+				double ratio = n1 / n2;
+				double cosI = dot(ray.u, Nrefract);
+				double sin2T = ratio * ratio * (1.0 - cosI * cosI);
+
+				if (sin2T > 1.0) {
+					Vector R = ray.u - 2.0 * dot(ray.u, Nrefract) * Nrefract;
+					R.normalize();
+					return getColor(Ray(P + Nrefract * 1e-4, R), recursion_depth + 1);
+				}
+
+				Vector T = ratio * ray.u - (ratio * cosI + sqrt(1.0 - sin2T)) * Nrefract;
+				T.normalize();
+				return getColor(Ray(P - Nrefract * 1e-4, T), recursion_depth + 1);
+			}
 
 			// test if there is a shadow by sending a new ray
 			// if there is no shadow, compute the formula with dot products etc.
@@ -216,18 +254,24 @@ public:
             int shadow_object_id;
             bool in_shadow = intersect(shadow_ray, shadow_P, shadow_t, shadow_N, shadow_object_id);
 
-            if (in_shadow && shadow_t < dist_to_light) {
-                return Vector(0, 0, 0); 
-            }
-            double dot_product = dot(N, L);
-            double n_dot_l = dot_product > 0.0 ? dot_product : 0.0; 
-            double intensity_factor = light_intensity / (4.0*M_PI*dist_to_light2);
-            Vector albedo = objects[object_id]->albedo;
-            
-            return (albedo / M_PI) * intensity_factor * n_dot_l;
-        }
+            Vector direct(0, 0, 0);
+			if (!in_shadow || shadow_t >= dist_to_light) {
+				double dot_product = dot(N, L);
+				double n_dot_l = dot_product > 0.0 ? dot_product : 0.0;
+				double intensity_factor = light_intensity / (4.0*M_PI*dist_to_light2);
+				direct = (objects[object_id]->albedo / M_PI) * intensity_factor * n_dot_l;
+			}
 
-        return Vector(0, 0, 0);
+			Vector indirect_dir = random_cos(N);
+			Ray indirect_ray(P + N * 1e-4, indirect_dir);
+			Vector Li = getColor(indirect_ray, recursion_depth + 1);
+			Vector albedo = objects[object_id]->albedo;
+			Vector indirect(albedo[0]*Li[0], albedo[1]*Li[1], albedo[2]*Li[2]);
+
+			return direct + indirect;
+        }
+		
+		return Vector(0,0,0);
     }
 
 	std::vector<const Object*> objects;
@@ -246,7 +290,10 @@ int main() {
 		engine[i].seed(i);
 	}
 
-	Sphere center_sphere(Vector(0, 0, 0), 10., Vector(0.8, 0.8, 0.8));
+	Sphere sphere_diffuse(Vector(-20, 0, 0), 10., Vector(0.8, 0.8, 0.8));
+	Sphere sphere_mirror(Vector(0, 0, 0), 10., Vector(0.8, 0.8, 0.8), true, false);
+	Sphere sphere_transparent(Vector(20, 0, 0), 10., Vector(0.8, 0.8, 0.8), false, true);
+
 	Sphere wall_left(Vector(-1000, 0, 0), 940, Vector(0.5, 0.8, 0.1));
 	Sphere wall_right(Vector(1000, 0, 0), 940, Vector(0.9, 0.2, 0.3));
 	Sphere wall_front(Vector(0, 0, -1000), 940, Vector(0.1, 0.6, 0.7));
@@ -262,7 +309,9 @@ int main() {
 	scene.gamma = 2.2;    // TODO (lab 1) : play with gamma ; typically, gamma = 2.2
 	scene.max_light_bounce = 5;
 
-	scene.addObject(&center_sphere);
+	scene.addObject(&sphere_diffuse);
+	scene.addObject(&sphere_mirror);
+	scene.addObject(&sphere_transparent);
 
 	scene.addObject(&wall_left);
 	scene.addObject(&wall_right);
@@ -278,19 +327,22 @@ int main() {
 #pragma omp parallel for schedule(dynamic, 1)
 	for (int i = 0; i < H; i++) {
 		for (int j = 0; j < W; j++) {
-			Vector color;
-
-			// TODO (lab 1) : correct ray_direction so that it goes through each pixel (j, i)
-			double x = j - W / 2.0 + 0.5;
-            double y = H / 2.0 - i - 0.5;
-            double z = -d;
-
-
-			Vector ray_direction(x, y, z);
-            ray_direction.normalize();
-
-            Ray ray(scene.camera_center, ray_direction);
-            color = scene.getColor(ray, 0);
+			Vector color(0, 0, 0);
+			int N_SAMPLES = 32;
+			for (int k = 0; k < N_SAMPLES; k++) {
+				double r1 = uniform(engine[omp_get_thread_num()]);
+				double r2 = uniform(engine[omp_get_thread_num()]);
+				double dx = 0.5 * sqrt(-2.0 * log(r1)) * cos(2.0 * M_PI * r2);
+				double dy = 0.5 * sqrt(-2.0 * log(r1)) * sin(2.0 * M_PI * r2);
+				double x = j - W / 2.0 + 0.5 + dx;
+				double y = H / 2.0 - i - 0.5 + dy;
+				double z = -d;
+				Vector ray_direction(x, y, z);
+				ray_direction.normalize();
+				Ray ray(scene.camera_center, ray_direction);
+				color = color + scene.getColor(ray, 0);
+			}
+			color = color / N_SAMPLES;
 
 			double c0 = 255. * std::pow(color[0] / 255., 1. / 2.2);
 			double c1 = 255. * std::pow(color[1] / 255., 1. / 2.2);
