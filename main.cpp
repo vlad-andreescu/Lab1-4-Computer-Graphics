@@ -137,6 +137,22 @@ public:
 };
 
 
+// ------------------------------------------------------------------
+// BVH node (lab 4, slides 8-10 and slide 47)
+//
+// Slide 47 (lab recap) explicitly lists the structure:
+//   - Left & right nodes
+//   - BBox
+//   - int start_index, end_index
+// ------------------------------------------------------------------
+struct BVHNode {
+	Vector    bmin, bmax;                      // bounding box of this node
+	BVHNode*  left  = nullptr;                 // child nodes (null for a leaf)
+	BVHNode*  right = nullptr;
+	int       start_index = 0, end_index = 0;  // range [start, end) in indices[]
+};
+
+
 class TriangleMesh : public Object {
 public:
 	TriangleMesh(const Vector& albedo, bool mirror = false, bool transparent = false)
@@ -144,6 +160,8 @@ public:
 		bmin = Vector( 1e18,  1e18,  1e18);
 		bmax = Vector(-1e18, -1e18, -1e18);
 	};
+
+	~TriangleMesh() { freeBVH(bvh_root); }
 
 	// scale then translate every vertex
 	void scale_translate(double s, const Vector& t) {
@@ -270,117 +288,205 @@ public:
 	}
 
 	// ------------------------------------------------------------------
-	// Lab 3 - Step 1: Ray vs. axis-aligned bounding box  (slide 7)
+	// Ray vs. axis-aligned bounding box  (slide 7)
 	//
 	// For each axis k, the two slab planes give:
 	//     t_k = (B_k - O_k) / u_k          (slide 7 formula)
 	// We compute t_entry = max over axes of min(t0,t1)
 	//            t_exit  = min over axes of max(t0,t1)
 	// The ray hits the box iff t_entry <= t_exit  AND  t_exit > 0.
+	//
+	// In Lab 4 we call this on every BVH node, so it takes (bmin,bmax)
+	// as parameters instead of using the mesh's global bbox.
 	// ------------------------------------------------------------------
-	bool intersectBBox(const Ray& ray) const {
+	static bool intersectAABB(const Vector& bb_min, const Vector& bb_max, const Ray& ray) {
 		double t_entry = -1e18;
 		double t_exit  =  1e18;
 
 		for (int k = 0; k < 3; k++) {
 			// slide 7: t^x = (B^x - O^x) / u^x   (same for y and z)
-			double t0 = (bmin[k] - ray.O[k]) / ray.u[k];
-			double t1 = (bmax[k] - ray.O[k]) / ray.u[k];
+			double t0 = (bb_min[k] - ray.O[k]) / ray.u[k];
+			double t1 = (bb_max[k] - ray.O[k]) / ray.u[k];
 
-			if (t0 > t1) std::swap(t0, t1);   // ensure t0 <= t1
+			if (t0 > t1) std::swap(t0, t1);
 
-			t_entry = std::max(t_entry, t0);   // latest entry across axes
-			t_exit  = std::min(t_exit,  t1);   // earliest exit across axes
+			t_entry = std::max(t_entry, t0);
+			t_exit  = std::min(t_exit,  t1);
 
-			if (t_exit < t_entry) return false; // intervals don't overlap -> miss
+			if (t_exit < t_entry) return false;
 		}
-		return t_exit > 0; // at least part of intersection is in front of ray
+		return t_exit > 0;
 	}
 
 	// ------------------------------------------------------------------
-	// Lab 3 - Step 2: Ray-mesh intersection
-	//   (a) fast-reject with the bounding box     (slide 7)
-	//   (b) Moller-Trumbore on every triangle     (slides 5 and 36)
+	// Lab 4 - BVH construction (slides 8-9, slide 47)
 	//
-	// Moller-Trumbore formulas (slide 5 / lab recap slide 36):
+	// "Reordering of triangles akin to QuickSort"  (slide 9):
+	//   - Pick the longest axis of the node's bbox
+	//   - Compute the middle of that axis
+	//   - All triangles whose center is below the middle go to the
+	//     beginning of the [start, end) range, the others to the end
+	//   - Recurse on the two ranges
+	//
+	// Each node stores: bbox, start_index, end_index, left/right children.
+	// ------------------------------------------------------------------
+	BVHNode* buildBVHRecursive(int start, int end) {
+		BVHNode* node = new BVHNode();
+		node->start_index = start;
+		node->end_index   = end;
+
+		// 1) Compute bounding box of all triangles in [start, end)
+		node->bmin = Vector( 1e18,  1e18,  1e18);
+		node->bmax = Vector(-1e18, -1e18, -1e18);
+		for (int i = start; i < end; i++) {
+			for (int v = 0; v < 3; v++) {
+				const Vector& V = vertices[indices[i].vtx[v]];
+				for (int k = 0; k < 3; k++) {
+					node->bmin[k] = std::min(node->bmin[k], V[k]);
+					node->bmax[k] = std::max(node->bmax[k], V[k]);
+				}
+			}
+		}
+
+		// 2) Stop condition: small ranges become leaves
+		int count = end - start;
+		if (count <= 5) return node;
+
+		// 3) Pick longest axis (slide 9: "usually: longest axis")
+		Vector diag = node->bmax - node->bmin;
+		int axis = 0;
+		if (diag[1] > diag[axis]) axis = 1;
+		if (diag[2] > diag[axis]) axis = 2;
+
+		// 4) Middle of that axis
+		double mid = 0.5 * (node->bmin[axis] + node->bmax[axis]);
+
+		// 5) QuickSort-style partition (slide 9):
+		//    triangles whose center is below mid go to the beginning
+		int pivot = start;
+		for (int i = start; i < end; i++) {
+			const Vector& A = vertices[indices[i].vtx[0]];
+			const Vector& B = vertices[indices[i].vtx[1]];
+			const Vector& C = vertices[indices[i].vtx[2]];
+			double center = (A[axis] + B[axis] + C[axis]) / 3.0;
+			if (center < mid) {
+				std::swap(indices[i], indices[pivot]);
+				pivot++;
+			}
+		}
+
+		// 6) Avoid degenerate split (everything on one side -> make leaf)
+		if (pivot == start || pivot == end) return node;
+
+		// 7) Recurse
+		node->left  = buildBVHRecursive(start, pivot);
+		node->right = buildBVHRecursive(pivot, end);
+		return node;
+	}
+
+	void buildBVH() {
+		freeBVH(bvh_root);
+		if (indices.empty()) { bvh_root = nullptr; return; }
+		bvh_root = buildBVHRecursive(0, (int)indices.size());
+		printf("[mesh] BVH built over %d triangles\n", (int)indices.size());
+	}
+
+	void freeBVH(BVHNode* n) {
+		if (!n) return;
+		freeBVH(n->left);
+		freeBVH(n->right);
+		delete n;
+	}
+
+	// ------------------------------------------------------------------
+	// Lab 4 - Ray-mesh intersection with BVH traversal (slide 10)
+	//
+	//   - Push tree's root
+	//   - If left child's box is intersected,  push left child
+	//   - If right child's box is intersected, push right child
+	//   - If leaf, test triangles in [start_index, end_index)
+	//   - Depth-first traversal (we keep `closest_t` so far so that
+	//     boxes farther than the current best can be pruned).
+	//
+	// Triangle test = Möller-Trumbore (slides 5 and 36):
 	//   e1 = B - A,   e2 = C - A,   N = e1 x e2
 	//   beta  =  < e2 , (A-O) x u > / < u , N >
 	//   gamma = -< e1 , (A-O) x u > / < u , N >
 	//   alpha = 1 - beta - gamma
 	//   t     =  < A-O , N >        / < u , N >
-	//
-	// Valid intersection: alpha, beta, gamma >= 0  and  t > 0.
 	// ------------------------------------------------------------------
 	bool intersect(const Ray& ray, Vector& P, double& t, Vector& N) const {
 
-		// ---- (a) bounding-box early-out (slide 7) ----
-		if (!intersectBBox(ray)) return false;
+		if (!bvh_root) return false;
+		if (!intersectAABB(bvh_root->bmin, bvh_root->bmax, ray)) return false;
 
 		double closest_t = 1e18;
 		bool   has_isect = false;
 
-		for (int tri = 0; tri < (int)indices.size(); tri++) {
+		// Depth-first stack traversal (slide 10)
+		BVHNode* stack[64];
+		int sp = 0;
+		stack[sp++] = bvh_root;
 
-			// Vertices A, B, C  (slide 5 notation)
-			const Vector& A = vertices[indices[tri].vtx[0]];
-			const Vector& B = vertices[indices[tri].vtx[1]];
-			const Vector& C = vertices[indices[tri].vtx[2]];
+		while (sp > 0) {
+			BVHNode* node = stack[--sp];
 
-			// e1 = B - A,  e2 = C - A   (slide 5)
-			Vector e1 = B - A;
-			Vector e2 = C - A;
+			// Leaf: run Möller-Trumbore on every triangle in the range
+			if (node->left == nullptr && node->right == nullptr) {
+				for (int tri = node->start_index; tri < node->end_index; tri++) {
 
-			// N = e1 x e2   (slide 5)
-			Vector N_tri = cross(e1, e2);
+					const Vector& A = vertices[indices[tri].vtx[0]];
+					const Vector& B = vertices[indices[tri].vtx[1]];
+					const Vector& C = vertices[indices[tri].vtx[2]];
 
-			// denominator = < u , N >   (slide 5)
-			double denom = dot(ray.u, N_tri);
+					Vector e1    = B - A;
+					Vector e2    = C - A;
+					Vector N_tri = cross(e1, e2);
 
-			// ray parallel to triangle plane -> skip
-			if (std::abs(denom) < 1e-12) continue;
+					double denom = dot(ray.u, N_tri);
+					if (std::abs(denom) < 1e-12) continue;
 
-			// A - O  (used in all three formulas)
-			Vector AmO = A - ray.O;
+					Vector AmO         = A - ray.O;
+					Vector AmO_cross_u = cross(AmO, ray.u);
 
-			// (A-O) x u   (shared sub-expression for beta and gamma)
-			Vector AmO_cross_u = cross(AmO, ray.u);
+					double beta   =  dot(e2, AmO_cross_u) / denom;
+					double gamma  = -dot(e1, AmO_cross_u) / denom;
+					double alpha  = 1.0 - beta - gamma;
+					double t_cand = dot(AmO, N_tri)       / denom;
 
-			// beta  =  < e2 , (A-O) x u > / < u , N >   (slide 5)
-			double beta  =  dot(e2, AmO_cross_u) / denom;
+					if (alpha >= 0.0 && beta >= 0.0 && gamma >= 0.0 &&
+					    t_cand > 1e-6 && t_cand < closest_t)
+					{
+						closest_t = t_cand;
+						has_isect = true;
+						t = t_cand;
+						P = ray.O + t_cand * ray.u;
 
-			// gamma = -< e1 , (A-O) x u > / < u , N >   (slide 5)
-			double gamma = -dot(e1, AmO_cross_u) / denom;
-
-			// alpha = 1 - beta - gamma   (slide 5)
-			double alpha = 1.0 - beta - gamma;
-
-			// t = < A-O , N > / < u , N >   (slide 5)
-			double t_cand = dot(AmO, N_tri) / denom;
-
-			// valid hit: all barycentric coords >= 0, t in front, closer than current best
-			if (alpha >= 0.0 && beta >= 0.0 && gamma >= 0.0 &&
-			    t_cand > 1e-6 && t_cand < closest_t)
-			{
-				closest_t = t_cand;
-				has_isect = true;
-				t = t_cand;
-				P = ray.O + t_cand * ray.u;
-
-				// Phong normal interpolation (slide 15):
-				//   N(P) = alpha*N_A + beta*N_B + gamma*N_C
-				if (!normals.empty() &&
-				    indices[tri].n[0] >= 0 &&
-				    indices[tri].n[1] >= 0 &&
-				    indices[tri].n[2] >= 0)
-				{
-					N = alpha * normals[indices[tri].n[0]]
-					  + beta  * normals[indices[tri].n[1]]
-					  + gamma * normals[indices[tri].n[2]];
-				} else {
-					N = N_tri;   // flat shading fallback
+						// Phong normal interpolation (slide 15)
+						if (!normals.empty() &&
+						    indices[tri].n[0] >= 0 &&
+						    indices[tri].n[1] >= 0 &&
+						    indices[tri].n[2] >= 0)
+						{
+							N = alpha * normals[indices[tri].n[0]]
+							  + beta  * normals[indices[tri].n[1]]
+							  + gamma * normals[indices[tri].n[2]];
+						} else {
+							N = N_tri;
+						}
+						N.normalize();
+					}
 				}
-				N.normalize();
+				continue;
 			}
+
+			// Internal node: push children whose boxes are intersected.
+			// We can also prune children whose nearest box-hit is farther
+			// than the current best closest_t.
+			if (node->left  && intersectAABB(node->left->bmin,  node->left->bmax,  ray))
+				stack[sp++] = node->left;
+			if (node->right && intersectAABB(node->right->bmin, node->right->bmax, ray))
+				stack[sp++] = node->right;
 		}
 
 		return has_isect;
@@ -395,6 +501,9 @@ public:
 
 	// axis-aligned bounding box corners (lab 3)
 	Vector bmin, bmax;
+
+	// BVH root (lab 4)
+	BVHNode* bvh_root = nullptr;
 };
 
 
@@ -511,6 +620,7 @@ int main() {
 	TriangleMesh mesh(Vector(0.8, 0.8, 0.8));
 	mesh.readOBJ("cat.obj");
 	mesh.scale_translate(0.6, Vector(0, -10, 0));
+	mesh.buildBVH();   // lab 4: must be called AFTER all vertex transforms
 
 	Scene scene;
 	scene.camera_center   = Vector(0, 0, 55);
