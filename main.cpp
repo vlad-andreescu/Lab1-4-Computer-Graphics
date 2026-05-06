@@ -80,7 +80,9 @@ class Object {
 public:
 	Object(const Vector& albedo, bool mirror = false, bool transparent = false) : albedo(albedo), mirror(mirror), transparent(transparent) {};
 
-	virtual bool intersect(const Ray& ray, Vector& P, double& t, Vector& N) const = 0;
+	// Returns true on hit. Outputs hit point P, distance t, surface normal N,
+	// and the local albedo (which may differ from this->albedo when textured).
+	virtual bool intersect(const Ray& ray, Vector& P, double& t, Vector& N, Vector& alb) const = 0;
 
 	Vector albedo;
 	bool mirror, transparent;
@@ -90,7 +92,7 @@ class Sphere : public Object {
 public:
 	Sphere(const Vector& center, double radius, const Vector& albedo, bool mirror = false, bool transparent = false) : ::Object(albedo, mirror, transparent), C(center), R(radius) {};
 
-	bool intersect(const Ray& ray, Vector& P, double &t, Vector& N) const {
+	bool intersect(const Ray& ray, Vector& P, double &t, Vector& N, Vector& alb) const {
 
         Vector OC = ray.O - C;
         double dot_u_OC = dot(ray.u, OC);
@@ -108,6 +110,7 @@ public:
         
         P = ray.O + t * ray.u;
         N = (P - C) / R;
+        alb = albedo;   // sphere has constant albedo
         return true;
     }
 
@@ -415,13 +418,15 @@ public:
 	//   alpha = 1 - beta - gamma
 	//   t     =  < A-O , N >        / < u , N >
 	// ------------------------------------------------------------------
-	bool intersect(const Ray& ray, Vector& P, double& t, Vector& N) const {
+	bool intersect(const Ray& ray, Vector& P, double& t, Vector& N, Vector& alb) const {
 
 		if (!bvh_root) return false;
 		if (!intersectAABB(bvh_root->bmin, bvh_root->bmax, ray)) return false;
 
 		double closest_t = 1e18;
 		bool   has_isect = false;
+		int    hit_tri   = -1;
+		double hit_alpha = 0, hit_beta = 0, hit_gamma = 0;
 
 		// Depth-first stack traversal (slide 10)
 		BVHNode* stack[64];
@@ -457,8 +462,13 @@ public:
 					if (alpha >= 0.0 && beta >= 0.0 && gamma >= 0.0 &&
 					    t_cand > 1e-6 && t_cand < closest_t)
 					{
-						closest_t = t_cand;
-						has_isect = true;
+						closest_t  = t_cand;
+						has_isect  = true;
+						hit_tri    = tri;
+						hit_alpha  = alpha;
+						hit_beta   = beta;
+						hit_gamma  = gamma;
+
 						t = t_cand;
 						P = ray.O + t_cand * ray.u;
 
@@ -481,15 +491,73 @@ public:
 			}
 
 			// Internal node: push children whose boxes are intersected.
-			// We can also prune children whose nearest box-hit is farther
-			// than the current best closest_t.
 			if (node->left  && intersectAABB(node->left->bmin,  node->left->bmax,  ray))
 				stack[sp++] = node->left;
 			if (node->right && intersectAABB(node->right->bmin, node->right->bmax, ray))
 				stack[sp++] = node->right;
 		}
 
+		// ---- Texture lookup at hit point (slide 16) ----
+		// uv(P) = alpha*uv_A + beta*uv_B + gamma*uv_C
+		if (has_isect) {
+			if (!texture_data.empty() && !uvs.empty() &&
+			    indices[hit_tri].uv[0] >= 0 &&
+			    indices[hit_tri].uv[1] >= 0 &&
+			    indices[hit_tri].uv[2] >= 0)
+			{
+				const Vector& uvA = uvs[indices[hit_tri].uv[0]];
+				const Vector& uvB = uvs[indices[hit_tri].uv[1]];
+				const Vector& uvC = uvs[indices[hit_tri].uv[2]];
+				double u = hit_alpha * uvA[0] + hit_beta * uvB[0] + hit_gamma * uvC[0];
+				double v = hit_alpha * uvA[1] + hit_beta * uvB[1] + hit_gamma * uvC[1];
+				alb = sampleTexture(u, v);
+			} else {
+				alb = albedo;   // no texture -> fall back to flat albedo
+			}
+		}
+
 		return has_isect;
+	}
+
+	// ------------------------------------------------------------------
+	// Texture support (slide 16)
+	// ------------------------------------------------------------------
+	void loadTexture(const char* path) {
+		int w, h, c;
+		unsigned char* data = stbi_load(path, &w, &h, &c, 0);
+		if (!data) {
+			printf("[mesh] WARNING: failed to load texture '%s'\n", path);
+			return;
+		}
+		texture_w = w;
+		texture_h = h;
+		texture_c = c;
+		texture_data.assign(data, data + (size_t)w * h * c);
+		stbi_image_free(data);
+		printf("[mesh] loaded texture %s : %dx%d, %d channels\n", path, w, h, c);
+	}
+
+	// Bilinear-free, nearest-neighbor lookup. UV in OBJ convention:
+	// v=0 is bottom, v=1 is top, while image rows go top->bottom,
+	// so we flip the v axis. We also gamma-decode (sRGB -> linear)
+	// because the rest of the pipeline does its own gamma at the end.
+	Vector sampleTexture(double u, double v) const {
+		// wrap (tile)
+		u = u - std::floor(u);
+		v = v - std::floor(v);
+
+		int x = (int)(u * texture_w);
+		int y = (int)((1.0 - v) * texture_h);
+		if (x < 0) x = 0; if (x >= texture_w) x = texture_w - 1;
+		if (y < 0) y = 0; if (y >= texture_h) y = texture_h - 1;
+
+		int idx = (y * texture_w + x) * texture_c;
+		double r = texture_data[idx + 0] / 255.0;
+		double g = (texture_c >= 2) ? texture_data[idx + 1] / 255.0 : r;
+		double b = (texture_c >= 3) ? texture_data[idx + 2] / 255.0 : r;
+
+		// sRGB -> linear (the final tone-map at the end re-applies gamma)
+		return Vector(std::pow(r, 2.2), std::pow(g, 2.2), std::pow(b, 2.2));
 	}
 
 
@@ -504,6 +572,10 @@ public:
 
 	// BVH root (lab 4)
 	BVHNode* bvh_root = nullptr;
+
+	// Texture (slide 16)
+	std::vector<unsigned char> texture_data;
+	int                        texture_w = 0, texture_h = 0, texture_c = 0;
 };
 
 
@@ -532,13 +604,13 @@ public:
 	Scene() {};
 	void addObject(const Object* obj) { objects.push_back(obj); }
 
-	bool intersect(const Ray& ray, Vector& P, double& t, Vector& N, int& object_id) const {
+	bool intersect(const Ray& ray, Vector& P, double& t, Vector& N, int& object_id, Vector& alb) const {
         double closest_t = 1e99;
         bool   has_isect = false;
         for (int i = 0; i < (int)objects.size(); i++) {
-            Vector cur_P, cur_N; double cur_t;
-            if (objects[i]->intersect(ray, cur_P, cur_t, cur_N) && cur_t < closest_t && cur_t > 0) {
-                closest_t = cur_t; object_id = i; P = cur_P; t = cur_t; N = cur_N; has_isect = true;
+            Vector cur_P, cur_N, cur_alb; double cur_t;
+            if (objects[i]->intersect(ray, cur_P, cur_t, cur_N, cur_alb) && cur_t < closest_t && cur_t > 0) {
+                closest_t = cur_t; object_id = i; P = cur_P; t = cur_t; N = cur_N; alb = cur_alb; has_isect = true;
             }
         }
         return has_isect;
@@ -547,8 +619,8 @@ public:
 	Vector getColor(const Ray& ray, int depth) {
 		if (depth >= max_light_bounce) return Vector(0,0,0);
 
-		Vector P, N; double t; int object_id;
-		if (!intersect(ray, P, t, N, object_id)) return Vector(0,0,0);
+		Vector P, N, alb; double t; int object_id;
+		if (!intersect(ray, P, t, N, object_id, alb)) return Vector(0,0,0);
 
 		// mirror
 		if (objects[object_id]->mirror) {
@@ -578,19 +650,18 @@ public:
 		double dist  = sqrt(dist2);
 		Vector L     = L_dir / dist;
 
-		Vector shP, shN; double sh_t; int sh_id;
-		bool in_shadow = intersect(Ray(P + N * 1e-4, L), shP, sh_t, shN, sh_id);
+		Vector shP, shN, shAlb; double sh_t; int sh_id;
+		bool in_shadow = intersect(Ray(P + N * 1e-4, L), shP, sh_t, shN, sh_id, shAlb);
 
 		Vector direct(0,0,0);
 		if (!in_shadow || sh_t >= dist) {
 			double ndotl = std::max(0.0, dot(N, L));
-			direct = (objects[object_id]->albedo / M_PI) * (light_intensity / (4.0 * M_PI * dist2)) * ndotl;
+			direct = (alb / M_PI) * (light_intensity / (4.0 * M_PI * dist2)) * ndotl;
 		}
 
 		// indirect lighting
 		Vector wi = random_cos(N);
 		Vector Li = getColor(Ray(P + N * 1e-4, wi), depth + 1);
-		Vector alb = objects[object_id]->albedo;
 		Vector indirect(alb[0]*Li[0], alb[1]*Li[1], alb[2]*Li[2]);
 
 		return direct + indirect;
@@ -619,6 +690,7 @@ int main() {
 	// Triangle mesh – adjust path, scale, and translation to match your cat.obj
 	TriangleMesh mesh(Vector(0.8, 0.8, 0.8));
 	mesh.readOBJ("cat.obj");
+	mesh.loadTexture("cat_diff.png");                  // slide 16: bitmap texture
 	mesh.scale_translate(0.6, Vector(0, -10, 0));
 	mesh.buildBVH();   // lab 4: must be called AFTER all vertex transforms
 
